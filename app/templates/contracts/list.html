@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Contracts - LicenseHubK12{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h1 class="h4 mb-0">Contracts</h1>
+  {% if current_user.has_role('Administrator', 'IT Administrator', 'School Administrator') %}
+  <button type="button" class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#newContractModal">
+    <i class="bi bi-plus-lg"></i> New Contract
+  </button>
+  {% endif %}
+</div>
+
+<div class="card mb-3"><div class="card-body">
+  <form method="get" class="row g-2">
+    <div class="col-md">
+      <input type="search" name="q" class="form-control form-control-sm" placeholder="PO number…" value="{{ request.args.get('q', '') }}">
+    </div>
+    <div class="col-md">
+      <select name="vendor_id" class="form-select form-select-sm">
+        <option value="">All vendors</option>
+        {% for v in vendors %}<option value="{{ v.id }}" {{ 'selected' if (request.args.get('vendor_id') | int(0)) == v.id }}>{{ v.name }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="col-md-auto"><button class="btn btn-sm btn-outline-primary" type="submit">Filter</button></div>
+    <div class="col-12">
+      <div class="accordion" id="statusAccordion">
+        <div class="accordion-item">
+          <h2 class="accordion-header">
+            <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#statusCollapse" aria-expanded="false" aria-controls="statusCollapse">
+              Status
+            </button>
+          </h2>
+          <div id="statusCollapse" class="accordion-collapse collapse">
+            <div class="accordion-body py-2">
+              <div class="d-flex flex-wrap gap-3">
+                {% for s in statuses %}
+                <div class="form-check">
+                  <input type="checkbox" class="form-check-input" name="status" value="{{ s }}" id="status_{{ s }}"
+                    {{ 'checked' if s in selected_statuses }} onchange="this.form.submit()">
+                  <label class="form-check-label small" for="status_{{ s }}">{{ status_label(s) }}</label>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <input type="hidden" name="status_filtered" value="1">
+    </div>
+  </form>
+</div></div>
+
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead><tr><th>PO Number</th><th>Vendor</th><th>Start Date</th><th>End Date</th><th>Licenses</th><th>Annual Cost</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for c in contracts %}
+        {% set computed = compute_expiration_status(c.end_date, thresholds) %}
+        <tr class="{{ 'table-danger' if c.days_until_end < 0 else 'table-warning' if c.days_until_end <= 30 else '' }}">
+          <td><a href="{{ url_for('contracts.view_contract', id=c.id) }}">{{ c.po_number }}</a></td>
+          <td>{{ c.vendor.name }}</td>
+          <td>{{ c.start_date | dateformat }}</td>
+          <td>{{ c.end_date | dateformat }}</td>
+          <td>{{ c.licenses | length }}</td>
+          <td>{{ c.annual_cost | money }}</td>
+          <td><span class="status-badge status-{{ computed }}">{{ status_label(computed) }}</span></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-muted text-center py-4">No contracts found.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-body">{% include "includes/pagination.html" %}</div>
+</div>
+
+{% if current_user.has_role('Administrator', 'IT Administrator') %}
+<div class="modal fade" id="newContractModal" tabindex="-1" aria-labelledby="newContractModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="get" action="{{ url_for('contracts.new_contract_redirect') }}">
+        <div class="modal-header">
+          <h2 class="modal-title h5" id="newContractModalLabel">New Contract</h2>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <label for="newContractVendorId" class="form-label">Vendor</label>
+          <select id="newContractVendorId" name="vendor_id" class="form-select" required>
+            <option value="" selected disabled>Choose a vendor…</option>
+            {% for v in vendors %}
+            <option value="{{ v.id }}">{{ v.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary">Continue</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

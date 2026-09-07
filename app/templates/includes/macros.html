@@ -1,0 +1,36 @@
+{% macro field(f, col="col-12") %}
+<div class="{{ col }} mb-3">
+  {% if f.type == 'BooleanField' %}
+    <div class="form-check">
+      {{ f(class="form-check-input") }}
+      {{ f.label(class="form-check-label") }}
+    </div>
+  {% elif f.type == 'TextAreaField' %}
+    {{ f.label(class="form-label") }}
+    {{ f(class="form-control" ~ (" is-invalid" if f.errors else ""), rows=3) }}
+  {% elif f.type == 'SelectField' %}
+    {{ f.label(class="form-label") }}
+    {{ f(class="form-select" ~ (" is-invalid" if f.errors else "")) }}
+  {% elif f.type == 'GradesField' %}
+    {{ f.label(class="form-label d-block") }}
+    <div class="d-flex flex-wrap gap-3">
+      {% for subfield in f %}
+        <div class="form-check form-check-inline mx-0">
+          {{ subfield(class="form-check-input") }}
+          {{ subfield.label(class="form-check-label") }}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    {{ f.label(class="form-label") }}
+    {{ f(class="form-control" ~ (" is-invalid" if f.errors else "")) }}
+  {% endif %}
+  {% for error in f.errors %}
+    <div class="invalid-feedback d-block">{{ error }}</div>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro status_badge(status) %}
+  <span class="status-badge status-{{ status }}">{{ status_label(status) }}</span>
+{% endmacro %}

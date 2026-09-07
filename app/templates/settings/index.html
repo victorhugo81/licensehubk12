@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% from "includes/macros.html" import field %}
+{% block title %}Settings - LicenseHubK12{% endblock %}
+{% block content %}
+<h1 class="h4 mb-3">Settings</h1>
+<div class="card">
+  <div class="card-header">License Status Thresholds</div>
+  <div class="card-body">
+    <p class="text-muted small">Controls when a license moves between Active, Upcoming, Warning, Critical and Expired across the dashboard, reports and notifications.</p>
+    <form method="post" novalidate>
+      {{ form.hidden_tag() }}
+      <div class="row">
+        {{ field(form.critical_days, "col-md-4") }}
+        {{ field(form.warning_days, "col-md-4") }}
+        {{ field(form.upcoming_days, "col-md-4") }}
+        {{ field(form.high_utilization_pct, "col-md-6") }}
+        {{ field(form.over_allocated_pct, "col-md-6") }}
+      </div>
+      {{ form.submit(class="btn btn-primary") }}
+    </form>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header">Notification Settings</div>
+  <div class="card-body">
+    <p class="text-muted small">Turn off any category you don't want to hear about — for example, only "License Expiring or Expired" and "New License Added" left on. Everything is on by default.</p>
+    <form method="post" action="{{ url_for('settings.notifications') }}" novalidate>
+      {{ notification_form.hidden_tag() }}
+      <div class="list-group list-group-flush mb-3">
+        {% for cat in notification_categories %}
+        {% set f = notification_form[cat.key] %}
+        <div class="list-group-item px-0 d-flex align-items-start gap-3">
+          <div class="form-check form-switch mt-1">
+            {{ f(class="form-check-input", role="switch") }}
+          </div>
+          <div>
+            <label class="fw-medium mb-0" for="{{ f.id }}">{{ cat.label }}</label>
+            <div class="text-muted small">{{ cat.description }}</div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {{ notification_form.submit(class="btn btn-primary") }}
+    </form>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header">Bulk User Import</div>
+  <div class="card-body">
+    <p class="text-muted small">Create many user accounts at once from a CSV file, or configure an automated daily import over FTP/FTPS.</p>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('user_imports.upload') }}" class="btn btn-outline-primary"><i class="bi bi-file-earmark-arrow-up"></i> Import CSV</a>
+      <a href="{{ url_for('user_imports.ftp_settings') }}" class="btn btn-outline-secondary"><i class="bi bi-arrow-repeat"></i> FTP Import Settings</a>
+      <a href="{{ url_for('user_imports.history') }}" class="btn btn-outline-secondary"><i class="bi bi-clock-history"></i> Import History</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

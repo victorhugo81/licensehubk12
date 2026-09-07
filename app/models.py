@@ -1,0 +1,546 @@
+import json
+import secrets
+from datetime import datetime, date, timezone
+
+from flask_login import UserMixin
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from app.extensions import db
+
+
+def utcnow():
+    # Naive UTC, deliberately - SQLite (local dev) round-trips
+    # DateTime(timezone=True) values as naive datetimes regardless of how
+    # they were written, so comparing against an aware "now" raises
+    # TypeError. Storing naive UTC everywhere keeps every comparison
+    # consistent across SQLite and MySQL/MariaDB (production).
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ---------------------------------------------------------------------------
+# Reference / lookup tables
+# ---------------------------------------------------------------------------
+
+class Role(db.Model):
+    __tablename__ = "roles"
+
+    ADMINISTRATOR = "Administrator"
+    IT_ADMINISTRATOR = "IT Administrator"
+    CURRICULUM_ADMINISTRATOR = "Curriculum Administrator"
+    SCHOOL_ADMINISTRATOR = "School Administrator"
+    VIEWER = "Viewer"
+
+    ALL = [ADMINISTRATOR, IT_ADMINISTRATOR, CURRICULUM_ADMINISTRATOR, SCHOOL_ADMINISTRATOR, VIEWER]
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(64), unique=True, nullable=False)
+    description = db.Column(db.String(255))
+
+    users = db.relationship("User", back_populates="role")
+
+    def __repr__(self):
+        return f"<Role {self.name}>"
+
+
+class Category(db.Model):
+    __tablename__ = "categories"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+
+    licenses = db.relationship("License", back_populates="category")
+
+    DEFAULTS = [
+        "Curriculum", "Assessment", "Student Information", "Learning Management",
+        "Intervention", "Special Education", "Data & Analytics", "Communication",
+        "Productivity", "Security", "Library", "Professional Development", "Other",
+    ]
+
+    def __repr__(self):
+        return f"<Category {self.name}>"
+
+
+class Setting(db.Model):
+    """Admin-configurable key/value settings (status thresholds, etc.)."""
+    __tablename__ = "settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.String(255), nullable=False)
+
+    @staticmethod
+    def get_int(key, default):
+        row = Setting.query.filter_by(key=key).first()
+        if row is None:
+            return default
+        try:
+            return int(row.value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def get_bool(key, default):
+        row = Setting.query.filter_by(key=key).first()
+        if row is None:
+            return default
+        return row.value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def set_value(key, value):
+        row = Setting.query.filter_by(key=key).first()
+        if row is None:
+            row = Setting(key=key, value=str(value))
+            db.session.add(row)
+        else:
+            row.value = str(value)
+        return row
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+class User(UserMixin, db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    first_name = db.Column(db.String(100), nullable=False)
+    last_name = db.Column(db.String(100), nullable=False)
+
+    role_id = db.Column(db.Integer, db.ForeignKey("roles.id"), nullable=False)
+    role = db.relationship("Role", back_populates="users")
+
+    # Only meaningful for School Administrator role - scopes visibility.
+    school_id = db.Column(db.Integer, db.ForeignKey("schools.id"), nullable=True)
+    school = db.relationship("School", back_populates="users")
+
+    is_active_account = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    last_login_at = db.Column(db.DateTime)
+
+    failed_login_attempts = db.Column(db.Integer, default=0, nullable=False)
+    locked_until = db.Column(db.DateTime)
+
+    reset_token = db.Column(db.String(255), unique=True, nullable=True)
+    reset_token_expires = db.Column(db.DateTime, nullable=True)
+
+    # Rotated every time the password changes (see set_password) so that
+    # get_id() below changes too - any session cookie signed with the old
+    # value then fails load_user()'s comparison and is treated as logged
+    # out. Without this, Flask-Login's stateless signed-cookie sessions
+    # have no server-side revocation: resetting a password after a stolen
+    # session/device does nothing to the attacker's already-issued cookie.
+    security_stamp = db.Column(db.String(32), default=lambda: secrets.token_hex(16), nullable=False)
+
+    def set_password(self, password: str):
+        self.password_hash = generate_password_hash(password)
+        self.security_stamp = secrets.token_hex(16)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+    def get_id(self):
+        return f"{self.id}.{self.security_stamp}"
+
+    @property
+    def full_name(self):
+        return f"{self.first_name} {self.last_name}"
+
+    # Flask-Login integration
+    @property
+    def is_active(self):
+        return self.is_active_account
+
+    def is_locked(self):
+        return bool(self.locked_until and self.locked_until > utcnow())
+
+    def has_role(self, *role_names):
+        return self.role and self.role.name in role_names
+
+    def can_view_school(self, school_id):
+        if self.has_role(Role.ADMINISTRATOR, Role.IT_ADMINISTRATOR, Role.CURRICULUM_ADMINISTRATOR, Role.VIEWER):
+            return True
+        if self.has_role(Role.SCHOOL_ADMINISTRATOR):
+            return self.school_id == school_id
+        return False
+
+    def __repr__(self):
+        return f"<User {self.email}>"
+
+
+# ---------------------------------------------------------------------------
+# Schools / Vendors
+# ---------------------------------------------------------------------------
+
+class School(db.Model):
+    __tablename__ = "schools"
+
+    TYPES = ["Elementary", "Middle School", "High School", "Alternative", "District Office", "Other"]
+    GRADES = ["PK", "K"] + [str(g) for g in range(1, 13)]
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False, index=True)
+    code = db.Column(db.String(30), unique=True, nullable=False)
+    school_type = db.Column(db.String(30), nullable=False, default="Elementary")
+    address = db.Column(db.String(255))
+    principal = db.Column(db.String(150))
+    grades = db.Column(db.String(50))
+    student_count = db.Column(db.Integer, default=0)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    users = db.relationship("User", back_populates="school")
+    allocations = db.relationship("LicenseAllocation", back_populates="school", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<School {self.name}>"
+
+
+class Vendor(db.Model):
+    __tablename__ = "vendors"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), unique=True, nullable=False, index=True)
+    website = db.Column(db.String(255))
+    support_email = db.Column(db.String(255))
+    support_phone = db.Column(db.String(50))
+    account_manager = db.Column(db.String(150))
+    account_number = db.Column(db.String(100))
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    licenses = db.relationship("License", back_populates="vendor")
+    contracts = db.relationship("Contract", back_populates="vendor")
+
+    @property
+    def total_annual_spend(self):
+        return sum((c.annual_cost or 0) for c in self.contracts)
+
+    def __repr__(self):
+        return f"<Vendor {self.name}>"
+
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+
+class License(db.Model):
+    __tablename__ = "licenses"
+
+    # Administrative lifecycle status (independent of the computed
+    # expiration countdown used for dashboard badge colors - see
+    # app/services/status.py).
+    STATUSES = ["Active", "Suspended", "Pending Renewal", "Cancelled"]
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False, index=True)
+    # Derived from contract.vendor_id at creation time - licenses are
+    # always created from their contract's page now, so there's no
+    # separate vendor picker; this column is kept for direct vendor-license
+    # queries (Vendor.licenses) without a join through Contract.
+    vendor_id = db.Column(db.Integer, db.ForeignKey("vendors.id"), nullable=False, index=True)
+    contract_id = db.Column(db.Integer, db.ForeignKey("contracts.id"), nullable=False, index=True)
+    category_id = db.Column(db.Integer, db.ForeignKey("categories.id"), nullable=True)
+    description = db.Column(db.Text)
+
+    license_count = db.Column(db.Integer, nullable=False, default=0)
+
+    po_number = db.Column(db.String(100))
+    support_url = db.Column(db.String(255))
+    login_url = db.Column(db.String(255))
+    notes = db.Column(db.Text)
+
+    status = db.Column(db.String(30), nullable=False, default="Active", index=True)
+
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+
+    vendor = db.relationship("Vendor", back_populates="licenses")
+    contract = db.relationship("Contract", back_populates="licenses")
+    category = db.relationship("Category", back_populates="licenses")
+    allocations = db.relationship("LicenseAllocation", back_populates="license", cascade="all, delete-orphan")
+
+    @property
+    def assigned_licenses(self):
+        return sum((a.allocated_count or 0) for a in self.allocations)
+
+    @property
+    def available_licenses(self):
+        return max((self.license_count or 0) - self.assigned_licenses, 0)
+
+    @property
+    def utilization_pct(self):
+        if not self.license_count:
+            return 0.0
+        return round((self.assigned_licenses / self.license_count) * 100, 1)
+
+    @property
+    def vendor_contact(self):
+        return self.contract.vendor_contact if self.contract else None
+
+    @property
+    def start_date(self):
+        return self.contract.start_date if self.contract else None
+
+    @start_date.setter
+    def start_date(self, value):
+        if self.contract:
+            self.contract.start_date = value
+
+    @property
+    def expiration_date(self):
+        return self.contract.end_date if self.contract else None
+
+    @expiration_date.setter
+    def expiration_date(self, value):
+        if self.contract:
+            self.contract.end_date = value
+
+    @property
+    def renewal_date(self):
+        return self.contract.renewal_date if self.contract else None
+
+    @renewal_date.setter
+    def renewal_date(self, value):
+        if self.contract:
+            self.contract.renewal_date = value
+
+    @property
+    def days_until_expiration(self):
+        if not self.expiration_date:
+            return None
+        return (self.expiration_date - date.today()).days
+
+    def __repr__(self):
+        return f"<License {self.name}>"
+
+
+class LicenseAllocation(db.Model):
+    """Allocation of a district's license count to a specific school."""
+    __tablename__ = "license_allocations"
+    __table_args__ = (
+        db.UniqueConstraint("license_id", "school_id", name="uq_allocation_license_school"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    license_id = db.Column(db.Integer, db.ForeignKey("licenses.id"), nullable=False, index=True)
+    school_id = db.Column(db.Integer, db.ForeignKey("schools.id"), nullable=False, index=True)
+    allocated_count = db.Column(db.Integer, nullable=False, default=0)
+    notes = db.Column(db.String(255))
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    license = db.relationship("License", back_populates="allocations")
+    school = db.relationship("School", back_populates="allocations")
+
+    def __repr__(self):
+        return f"<LicenseAllocation license={self.license_id} school={self.school_id} count={self.allocated_count}>"
+
+
+class Contract(db.Model):
+    __tablename__ = "contracts"
+
+    PAYMENT_FREQUENCIES = ["Monthly", "Quarterly", "Annual", "Multi-Year", "One-Time"]
+
+    id = db.Column(db.Integer, primary_key=True)
+    # The one identifying number for a contract - there's no separate
+    # contract_number, to avoid carrying two identifying numbers for the
+    # same agreement.
+    po_number = db.Column(db.String(100), nullable=False, index=True)
+    vendor_id = db.Column(db.Integer, db.ForeignKey("vendors.id"), nullable=False, index=True)
+
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False, index=True)
+    renewal_date = db.Column(db.Date)
+
+    annual_cost = db.Column(db.Numeric(12, 2), default=0)
+    vendor_contact = db.Column(db.String(150))
+    payment_frequency = db.Column(db.String(30), nullable=False, default="Annual")
+    auto_renewal = db.Column(db.Boolean, default=False, nullable=False)
+    cancellation_deadline = db.Column(db.Date)
+    notes = db.Column(db.Text)
+
+    # The uploaded contract document (PDF/Word), if any. file_path is a
+    # server-generated random filename under UPLOAD_FOLDER/contracts/, never
+    # derived from the uploaded filename - file_name is the original name,
+    # kept only for display and as the download's Content-Disposition name.
+    contract_file_name = db.Column(db.String(255))
+    contract_file_path = db.Column(db.String(255))
+
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    vendor = db.relationship("Vendor", back_populates="contracts")
+    licenses = db.relationship("License", back_populates="contract")
+
+    @property
+    def days_until_end(self):
+        return (self.end_date - date.today()).days
+
+    @property
+    def file_is_previewable(self):
+        # Only PDFs render inline in a browser tab - Word docs would just
+        # trigger a download (or an ugly plugin prompt) regardless of
+        # Content-Disposition, so the "Preview" action only makes sense here.
+        return bool(self.contract_file_name and self.contract_file_name.lower().endswith(".pdf"))
+
+    def __repr__(self):
+        return f"<Contract {self.po_number}>"
+
+
+# ---------------------------------------------------------------------------
+# Notifications / Audit / Imports
+# ---------------------------------------------------------------------------
+
+class Notification(db.Model):
+    __tablename__ = "notifications"
+
+    TYPES = [
+        "license_expiration", "contract_expiration", "renewal_deadline",
+        "high_utilization", "over_allocated", "unused_licenses", "license_expired",
+        "license_added",
+    ]
+    SEVERITIES = ["critical", "warning", "info"]
+
+    id = db.Column(db.Integer, primary_key=True)
+    # Null user_id = district-wide notification visible to all admin roles.
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True, index=True)
+    type = db.Column(db.String(50), nullable=False)
+    severity = db.Column(db.String(20), nullable=False, default="info")
+    title = db.Column(db.String(255), nullable=False)
+    message = db.Column(db.Text)
+
+    related_object_type = db.Column(db.String(50))
+    related_object_id = db.Column(db.Integer)
+
+    is_read = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
+
+    @property
+    def link_url(self):
+        """Where clicking this notification should go, or None if it has
+        no navigable related object (or that object no longer exists)."""
+        from flask import url_for
+        if self.related_object_type == "license" and self.related_object_id:
+            return url_for("licenses.view_license", id=self.related_object_id)
+        if self.related_object_type == "contract" and self.related_object_id:
+            return url_for("contracts.view_contract", id=self.related_object_id)
+        return None
+
+    def __repr__(self):
+        return f"<Notification {self.type} {self.title}>"
+
+
+class AuditLog(db.Model):
+    __tablename__ = "audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True, index=True)
+    action = db.Column(db.String(50), nullable=False)
+    object_type = db.Column(db.String(50), nullable=False, index=True)
+    object_id = db.Column(db.Integer)
+    timestamp = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
+    ip_address = db.Column(db.String(64))
+    changes_json = db.Column(db.Text)
+
+    user = db.relationship("User")
+
+    @property
+    def changes(self):
+        if not self.changes_json:
+            return {}
+        try:
+            return json.loads(self.changes_json)
+        except ValueError:
+            return {}
+
+    @changes.setter
+    def changes(self, value: dict):
+        self.changes_json = json.dumps(value, default=str)
+
+    def __repr__(self):
+        return f"<AuditLog {self.action} {self.object_type}#{self.object_id}>"
+
+
+class ImportHistory(db.Model):
+    __tablename__ = "import_history"
+
+    id = db.Column(db.Integer, primary_key=True)
+    # "license" (CSV license/allocation import) or "user" (bulk user import,
+    # manual CSV or FTP-pulled) - one history table, discriminated by kind,
+    # rather than a near-duplicate table per import type.
+    kind = db.Column(db.String(20), default="license", nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    imported_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    imported_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    total_records = db.Column(db.Integer, default=0)
+    valid_records = db.Column(db.Integer, default=0)
+    warning_records = db.Column(db.Integer, default=0)
+    error_records = db.Column(db.Integer, default=0)
+
+    status = db.Column(db.String(30), default="completed")
+    details_json = db.Column(db.Text)
+
+    imported_by = db.relationship("User")
+
+    @property
+    def details(self):
+        if not self.details_json:
+            return {}
+        try:
+            return json.loads(self.details_json)
+        except ValueError:
+            return {}
+
+    @details.setter
+    def details(self, value: dict):
+        self.details_json = json.dumps(value, default=str)
+
+    def __repr__(self):
+        return f"<ImportHistory {self.filename}>"
+
+
+class FtpImportSettings(db.Model):
+    """Single-row configuration for the optional scheduled FTP user import
+    (app/integrations/ftp_users.py). There is at most one row (id=1);
+    get_or_create() is the only way callers should fetch/create it.
+    password_encrypted is never stored or logged in plaintext - use the
+    password property (app/utils/crypto.py) to set/read it."""
+    __tablename__ = "ftp_import_settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    is_enabled = db.Column(db.Boolean, default=False, nullable=False)
+    host = db.Column(db.String(255))
+    port = db.Column(db.Integer, default=21, nullable=False)
+    username = db.Column(db.String(255))
+    password_encrypted = db.Column(db.Text)
+    remote_path = db.Column(db.String(500))
+    use_tls = db.Column(db.Boolean, default=True, nullable=False)
+
+    last_run_at = db.Column(db.DateTime)
+    last_status = db.Column(db.String(20))  # success | error
+    last_message = db.Column(db.Text)
+
+    @property
+    def password(self):
+        from app.utils.crypto import decrypt_value
+        return decrypt_value(self.password_encrypted or "")
+
+    @password.setter
+    def password(self, value):
+        from app.utils.crypto import encrypt_value
+        self.password_encrypted = encrypt_value(value or "")
+
+    def is_configured(self) -> bool:
+        return bool(self.is_enabled and self.host and self.username and self.password and self.remote_path)
+
+    @staticmethod
+    def get_or_create():
+        row = FtpImportSettings.query.get(1)
+        if row is None:
+            row = FtpImportSettings(id=1)
+            db.session.add(row)
+            db.session.flush()
+        return row

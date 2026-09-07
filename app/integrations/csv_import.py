@@ -1,0 +1,288 @@
+"""CSV bulk import for license/school-allocation data (spec section 12).
+
+Two-phase by design: `validate_csv()` never touches the database and is
+safe to call repeatedly for a preview; `commit_import()` is the only
+function that writes, and it re-validates against live DB state (via
+app.services.allocation) before writing each row so a race between preview
+and commit can't smuggle in an over-allocation.
+
+Expected columns: license, vendor, school, total_licenses,
+assigned_licenses, expiration_date, annual_cost
+"""
+import csv
+import io
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from decimal import Decimal, InvalidOperation
+
+from app.extensions import db
+from app.models import Category, Contract, License, School, Vendor
+from app.services import allocation as allocation_service
+from app.services import notifications
+
+REQUIRED_COLUMNS = ["license", "vendor", "school", "total_licenses", "assigned_licenses", "expiration_date", "annual_cost"]
+
+# MAX_CONTENT_LENGTH already caps upload size, but a small file can still
+# pack a huge number of rows; this bounds the per-row and cross-row
+# validation work regardless of file size (CWE-400, uncontrolled resource
+# consumption).
+MAX_ROWS = 20_000
+
+
+@dataclass
+class RowResult:
+    row_number: int
+    data: dict
+    status: str = "valid"  # valid | warning | error
+    messages: list = field(default_factory=list)
+
+    def add_error(self, msg):
+        self.status = "error"
+        self.messages.append(msg)
+
+    def add_warning(self, msg):
+        if self.status != "error":
+            self.status = "warning"
+        self.messages.append(msg)
+
+
+@dataclass
+class ImportPreview:
+    rows: list
+    total: int
+    valid: int
+    warnings: int
+    errors: int
+    column_errors: list = field(default_factory=list)
+
+
+def _parse_int(value):
+    try:
+        n = int(str(value).strip())
+        if n < 0:
+            return None
+        return n
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_decimal(value):
+    try:
+        d = Decimal(str(value).strip())
+        if d < 0:
+            return None
+        return d
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _parse_date(value):
+    value = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def validate_csv(file_stream) -> ImportPreview:
+    """Read a CSV file-like object (text) and return a validation preview.
+    Performs no database writes."""
+    raw = file_stream.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(raw))
+
+    if reader.fieldnames is None:
+        return ImportPreview(rows=[], total=0, valid=0, warnings=0, errors=0,
+                              column_errors=["The file is empty or not a valid CSV."])
+
+    missing = [c for c in REQUIRED_COLUMNS if c not in reader.fieldnames]
+    if missing:
+        return ImportPreview(rows=[], total=0, valid=0, warnings=0, errors=0,
+                              column_errors=[f"Missing required column(s): {', '.join(missing)}"])
+
+    raw_rows = list(reader)
+    if len(raw_rows) > MAX_ROWS:
+        return ImportPreview(rows=[], total=0, valid=0, warnings=0, errors=0,
+                              column_errors=[f"This file has {len(raw_rows)} rows; the limit is {MAX_ROWS:,} per import. Split it into smaller files."])
+    reader = raw_rows
+
+    existing_schools = {s.name.strip().lower(): s for s in School.query.all()}
+    existing_licenses = {lic.name.strip().lower(): lic for lic in License.query.all()}
+
+    rows: list[RowResult] = []
+    license_totals: dict[str, int] = {}
+    license_assigned_sum: dict[str, int] = {}
+
+    for i, raw_row in enumerate(reader, start=2):  # header is row 1
+        result = RowResult(row_number=i, data=dict(raw_row))
+        license_name = (raw_row.get("license") or "").strip()
+        vendor_name = (raw_row.get("vendor") or "").strip()
+        school_name = (raw_row.get("school") or "").strip()
+
+        if not license_name:
+            result.add_error("License name is required.")
+        if not vendor_name:
+            result.add_error("Vendor is required.")
+        if not school_name:
+            result.add_error("School is required.")
+
+        school = existing_schools.get(school_name.lower()) if school_name else None
+        if school_name and school is None:
+            result.add_error(f"School '{school_name}' does not exist in LicenseHubK12.")
+
+        total_licenses = _parse_int(raw_row.get("total_licenses"))
+        if total_licenses is None:
+            result.add_error("total_licenses must be a non-negative integer.")
+
+        assigned_licenses = _parse_int(raw_row.get("assigned_licenses"))
+        if assigned_licenses is None:
+            result.add_error("assigned_licenses must be a non-negative integer.")
+
+        if total_licenses is not None and assigned_licenses is not None and assigned_licenses > total_licenses:
+            result.add_error("assigned_licenses cannot exceed total_licenses.")
+
+        expiration = _parse_date(raw_row.get("expiration_date"))
+        if raw_row.get("expiration_date") and expiration is None:
+            result.add_error("expiration_date must be YYYY-MM-DD or MM/DD/YYYY.")
+        elif expiration and expiration < date.today():
+            result.add_warning("expiration_date is in the past.")
+
+        annual_cost = _parse_decimal(raw_row.get("annual_cost"))
+        if raw_row.get("annual_cost") and annual_cost is None:
+            result.add_error("annual_cost must be a non-negative number.")
+
+        existing_lic = existing_licenses.get(license_name.lower()) if license_name else None
+        if existing_lic and existing_lic.vendor.name.strip().lower() != vendor_name.lower():
+            result.add_warning(
+                f"'{license_name}' already exists with vendor '{existing_lic.vendor.name}'; "
+                f"the vendor will not be changed to '{vendor_name}'."
+            )
+
+        if license_name and total_licenses is not None:
+            key = license_name.lower()
+            license_totals[key] = max(license_totals.get(key, 0), total_licenses)
+
+        rows.append(result)
+
+    # Cross-row check: total assigned per license (this import batch) can't
+    # exceed that license's district total_licenses.
+    for result in rows:
+        if result.status == "error":
+            continue
+        key = (result.data.get("license") or "").strip().lower()
+        assigned = _parse_int(result.data.get("assigned_licenses")) or 0
+        license_assigned_sum[key] = license_assigned_sum.get(key, 0) + assigned
+
+    for result in rows:
+        if result.status == "error":
+            continue
+        key = (result.data.get("license") or "").strip().lower()
+        total = license_totals.get(key)
+        assigned_sum = license_assigned_sum.get(key)
+        if total is not None and assigned_sum is not None and assigned_sum > total:
+            result.add_error(
+                f"Combined assigned_licenses across all rows for '{result.data.get('license')}' "
+                f"({assigned_sum}) exceeds its total_licenses ({total})."
+            )
+
+    valid = sum(1 for r in rows if r.status == "valid")
+    warnings = sum(1 for r in rows if r.status == "warning")
+    errors = sum(1 for r in rows if r.status == "error")
+
+    return ImportPreview(rows=rows, total=len(rows), valid=valid, warnings=warnings, errors=errors)
+
+
+def _get_or_create_import_contract(vendor, license_name, end_date, annual_cost):
+    """Every License needs a Contract (required FK), and Annual Cost lives
+    on Contract - the CSV format has no po_number/vendor_contact columns to
+    key one on, so import instead maintains one canonical, stable-keyed
+    contract per license name/vendor pair, so re-importing an updated CSV
+    reuses that same contract (and updates its cost) rather than creating
+    duplicates. Must exist before the License row does, since
+    License.contract_id can't be null even briefly."""
+    po_number = f"IMPORT-{license_name.strip()}"[:100]
+    contract = Contract.query.filter_by(vendor_id=vendor.id, po_number=po_number).first()
+    if contract is None:
+        contract = Contract(
+            po_number=po_number, vendor=vendor,
+            start_date=date.today(), end_date=end_date,
+            payment_frequency="Annual", annual_cost=annual_cost,
+        )
+        db.session.add(contract)
+        db.session.flush()
+    else:
+        contract.end_date = end_date
+        if annual_cost:
+            contract.annual_cost = annual_cost
+    return contract
+
+
+def commit_import(preview: ImportPreview, imported_by=None):
+    """Commit every non-error row from a previously computed preview.
+    Errors are never imported. Returns (created_licenses, updated_licenses, allocation_errors)."""
+    created, updated = 0, 0
+    allocation_errors = []
+
+    for result in preview.rows:
+        if result.status == "error":
+            continue
+
+        data = result.data
+        license_name = data["license"].strip()
+        vendor_name = data["vendor"].strip()
+        school_name = data["school"].strip()
+        total_licenses = _parse_int(data.get("total_licenses"))
+        assigned_licenses = _parse_int(data.get("assigned_licenses")) or 0
+        expiration = _parse_date(data.get("expiration_date"))
+        annual_cost = _parse_decimal(data.get("annual_cost")) or Decimal("0")
+
+        vendor = Vendor.query.filter(db.func.lower(Vendor.name) == vendor_name.lower()).first()
+        if vendor is None:
+            vendor = Vendor(name=vendor_name)
+            db.session.add(vendor)
+            db.session.flush()
+
+        school = School.query.filter(db.func.lower(School.name) == school_name.lower()).first()
+        if school is None:
+            allocation_errors.append(f"Row {result.row_number}: school '{school_name}' not found, skipped.")
+            continue
+
+        lic = License.query.filter(db.func.lower(License.name) == license_name.lower()).first()
+        if lic is None:
+            end_date = expiration or (date.today() + timedelta(days=365))
+            contract = _get_or_create_import_contract(vendor, license_name, end_date, annual_cost)
+            lic = License(
+                name=license_name,
+                vendor=vendor,
+                contract=contract,
+                license_count=total_licenses or 0,
+                status="Active",
+                created_by_id=imported_by.id if imported_by else None,
+            )
+            db.session.add(lic)
+            db.session.flush()
+            created += 1
+            notifications.notify(
+                "license_added", f"New license added: {lic.name}",
+                f"{lic.name} was added via CSV import.",
+                severity="info", related_object_type="license", related_object_id=lic.id,
+            )
+        else:
+            if total_licenses is not None:
+                lic.license_count = max(lic.license_count, total_licenses)
+            if expiration and lic.contract:
+                lic.contract.end_date = expiration
+            if annual_cost and lic.contract:
+                lic.contract.annual_cost = annual_cost
+            updated += 1
+
+        try:
+            allocation_service.set_allocation(lic, school, assigned_licenses)
+        except allocation_service.AllocationError as exc:
+            allocation_errors.append(f"Row {result.row_number}: {exc}")
+
+    db.session.commit()
+    return created, updated, allocation_errors
