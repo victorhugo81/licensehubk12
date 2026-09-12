@@ -3,7 +3,7 @@ from flask_login import current_user, login_required
 
 from app.extensions import db
 from app.forms import UserForm
-from app.models import Role, User
+from app.models import Role, School, User
 from app.services.audit import diff_changes, log_action
 from app.utils.decorators import permission_required
 
@@ -14,7 +14,7 @@ PER_PAGE = 20
 
 def _form_data(u):
     return {
-        "first_name": u.first_name, "last_name": u.last_name, "email": u.email,
+        "first_name": u.first_name, "middle_name": u.middle_name, "last_name": u.last_name, "email": u.email,
         "role_id": u.role_id, "school_id": u.school_id, "is_active_account": u.is_active_account,
     }
 
@@ -27,9 +27,28 @@ def list_users():
     query = User.query
     if q:
         query = query.filter(User.email.ilike(f"%{q}%") | User.first_name.ilike(f"%{q}%") | User.last_name.ilike(f"%{q}%"))
+
+    role_id = request.args.get("role_id", type=int)
+    if role_id:
+        query = query.filter(User.role_id == role_id)
+
+    school_id = request.args.get("school_id", type=int)
+    if school_id:
+        query = query.filter(User.school_id == school_id)
+
+    status = request.args.get("status", "").strip()
+    if status == "active":
+        query = query.filter(User.is_active_account.is_(True))
+    elif status == "inactive":
+        query = query.filter(User.is_active_account.is_(False))
+
     page = request.args.get("page", 1, type=int)
     pagination = query.order_by(User.last_name).paginate(page=page, per_page=PER_PAGE, error_out=False)
-    return render_template("users/list.html", pagination=pagination, users=pagination.items)
+    return render_template(
+        "users/list.html", pagination=pagination, users=pagination.items,
+        roles=Role.query.order_by(Role.name).all(),
+        schools=School.query.order_by(School.name).all(),
+    )
 
 
 @users_bp.route("/add", methods=["GET", "POST"])
@@ -44,7 +63,8 @@ def add_user():
             form.email.errors.append("A user with this email already exists.")
         else:
             user = User(
-                first_name=form.first_name.data, last_name=form.last_name.data,
+                first_name=form.first_name.data, middle_name=form.middle_name.data.strip() or None,
+                last_name=form.last_name.data,
                 email=form.email.data.strip().lower(), role_id=form.role_id.data,
                 school_id=form.school_id.data or None, is_active_account=form.is_active_account.data,
             )
@@ -74,6 +94,7 @@ def edit_user(id):
             return render_template("users/form.html", form=form, user=user)
 
         user.first_name = form.first_name.data
+        user.middle_name = form.middle_name.data.strip() or None
         user.last_name = form.last_name.data
         user.email = form.email.data.strip().lower()
         user.role_id = form.role_id.data
